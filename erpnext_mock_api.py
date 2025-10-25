@@ -1,30 +1,83 @@
 """
-ERPNext Mock API Server
-Mimics ERPNext API endpoints for testing the erpnext_connector module
+ERPNext Mock API Server with SQL Database Storage
+Mimics ERPNext API endpoints and persists data to a remote SQL database
 """
 
 from flask import Flask, request, jsonify
 from datetime import datetime
 import json
-import re
+import os
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.pool import NullPool
 
 app = Flask(__name__)
 
-# In-memory storage for created documents
-documents = {
+# Database Configuration
+# Set your database URL as an environment variable or directly here
+# Format: postgresql://user:password@host:port/database
+# or: mysql+pymysql://user:password@host:port/database
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:password@host:port/dbname')
+
+# SQLAlchemy setup
+Base = declarative_base()
+
+# Database Models
+class Document(Base):
+    """Generic document storage table"""
+    __tablename__ = 'erpnext_documents'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doctype = Column(String(100), nullable=False, index=True)
+    name = Column(String(200), nullable=False, unique=True, index=True)
+    data = Column(Text, nullable=False)  # JSON string
+    docstatus = Column(Integer, default=0)
+    creation = Column(DateTime, default=datetime.utcnow)
+    modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    owner = Column(String(100), default='Administrator')
+
+
+class Counter(Base):
+    """Counter for generating document names"""
+    __tablename__ = 'erpnext_counters'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doctype = Column(String(100), nullable=False, unique=True)
+    counter = Column(Integer, default=1)
+
+
+# Initialize database
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=NullPool,  # Disable connection pooling for serverless
+        echo=False
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = scoped_session(sessionmaker(bind=engine))
+    print("✅ Database connected successfully")
+except Exception as e:
+    print(f"❌ Database connection failed: {str(e)}")
+    print("   Falling back to in-memory storage")
+    engine = None
+    SessionLocal = None
+
+
+# Fallback in-memory storage
+documents_memory = {
     'Customer': {},
     'Journal Entry': {},
     'Purchase Invoice': {},
     'Payment Entry': {}
 }
-
-# Counter for generating unique document names
-counters = {
+counters_memory = {
     'Customer': 1,
     'Journal Entry': 1,
     'Purchase Invoice': 1,
     'Payment Entry': 1
 }
+
 
 # Mock authentication
 VALID_API_KEYS = {
@@ -33,12 +86,19 @@ VALID_API_KEYS = {
 }
 
 
+def get_db():
+    """Get database session"""
+    if SessionLocal:
+        return SessionLocal()
+    return None
+
+
 def authenticate():
     """Check if request has valid authentication"""
     auth_header = request.headers.get('Authorization', '')
     
     if auth_header.startswith('token '):
-        token = auth_header[6:]  # Remove 'token ' prefix
+        token = auth_header[6:]
         try:
             api_key, api_secret = token.split(':')
             if VALID_API_KEYS.get(api_key) == api_secret:
@@ -49,10 +109,29 @@ def authenticate():
     return False
 
 
-def generate_doc_name(doctype):
+def get_next_counter(doctype, db=None):
+    """Get and increment counter for document name generation"""
+    if db:
+        counter_obj = db.query(Counter).filter_by(doctype=doctype).first()
+        if not counter_obj:
+            counter_obj = Counter(doctype=doctype, counter=1)
+            db.add(counter_obj)
+            db.commit()
+        
+        current = counter_obj.counter
+        counter_obj.counter += 1
+        db.commit()
+        return current
+    else:
+        # Fallback to memory
+        current = counters_memory.get(doctype, 1)
+        counters_memory[doctype] = current + 1
+        return current
+
+
+def generate_doc_name(doctype, db=None):
     """Generate a document name like ERPNext does"""
-    counter = counters[doctype]
-    counters[doctype] += 1
+    counter = get_next_counter(doctype, db)
     
     if doctype == 'Customer':
         return f"CUST-{counter:05d}"
@@ -64,6 +143,77 @@ def generate_doc_name(doctype):
         return f"ACC-PAY-{datetime.now().year}-{counter:05d}"
     
     return f"{doctype}-{counter}"
+
+
+def save_document(doctype, doc_name, doc_data, db=None):
+    """Save document to database or memory"""
+    if db:
+        # Check if document exists
+        existing = db.query(Document).filter_by(name=doc_name).first()
+        
+        if existing:
+            existing.data = json.dumps(doc_data)
+            existing.modified = datetime.utcnow()
+            existing.docstatus = doc_data.get('docstatus', 0)
+        else:
+            doc = Document(
+                doctype=doctype,
+                name=doc_name,
+                data=json.dumps(doc_data),
+                docstatus=doc_data.get('docstatus', 0),
+                owner=doc_data.get('owner', 'Administrator')
+            )
+            db.add(doc)
+        
+        db.commit()
+    else:
+        # Fallback to memory
+        if doctype not in documents_memory:
+            documents_memory[doctype] = {}
+        documents_memory[doctype][doc_name] = doc_data
+
+
+def get_document(doctype, doc_name, db=None):
+    """Get document from database or memory"""
+    if db:
+        doc = db.query(Document).filter_by(doctype=doctype, name=doc_name).first()
+        if doc:
+            return json.loads(doc.data)
+        return None
+    else:
+        # Fallback to memory
+        return documents_memory.get(doctype, {}).get(doc_name)
+
+
+def list_documents(doctype, limit_start=0, limit_page_length=20, db=None):
+    """List documents from database or memory"""
+    if db:
+        docs = db.query(Document).filter_by(doctype=doctype)\
+            .offset(limit_start)\
+            .limit(limit_page_length)\
+            .all()
+        return [json.loads(doc.data) for doc in docs]
+    else:
+        # Fallback to memory
+        doc_list = list(documents_memory.get(doctype, {}).values())
+        return doc_list[limit_start:limit_start + limit_page_length]
+
+
+def delete_document(doctype, doc_name, db=None):
+    """Delete document from database or memory"""
+    if db:
+        doc = db.query(Document).filter_by(doctype=doctype, name=doc_name).first()
+        if doc:
+            db.delete(doc)
+            db.commit()
+            return True
+        return False
+    else:
+        # Fallback to memory
+        if doctype in documents_memory and doc_name in documents_memory[doctype]:
+            del documents_memory[doctype][doc_name]
+            return True
+        return False
 
 
 @app.route('/api/method/frappe.auth.get_logged_user', methods=['GET'])
@@ -89,24 +239,20 @@ def get_resources(doctype):
             'exc_type': 'AuthenticationError'
         }), 401
     
-    if doctype not in documents:
+    db = get_db()
+    
+    try:
+        limit_start = int(request.args.get('limit_start', 0))
+        limit_page_length = int(request.args.get('limit_page_length', 20))
+        
+        doc_list = list_documents(doctype, limit_start, limit_page_length, db)
+        
         return jsonify({
-            'exc': f'DocType {doctype} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    # Get query parameters
-    fields = request.args.get('fields', '["name"]')
-    limit_start = int(request.args.get('limit_start', 0))
-    limit_page_length = int(request.args.get('limit_page_length', 20))
-    
-    # Return list of documents
-    doc_list = list(documents[doctype].values())
-    paginated = doc_list[limit_start:limit_start + limit_page_length]
-    
-    return jsonify({
-        'data': paginated
-    })
+            'data': doc_list
+        })
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/<doctype>/<name>', methods=['GET'])
@@ -118,21 +264,23 @@ def get_resource(doctype, name):
             'exc_type': 'AuthenticationError'
         }), 401
     
-    if doctype not in documents:
-        return jsonify({
-            'exc': f'DocType {doctype} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
+    db = get_db()
     
-    if name not in documents[doctype]:
+    try:
+        doc = get_document(doctype, name, db)
+        
+        if not doc:
+            return jsonify({
+                'exc': f'{doctype} {name} not found',
+                'exc_type': 'DoesNotExistError'
+            }), 404
+        
         return jsonify({
-            'exc': f'{doctype} {name} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    return jsonify({
-        'data': documents[doctype][name]
-    })
+            'data': doc
+        })
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/Customer', methods=['POST'])
@@ -146,38 +294,40 @@ def create_customer():
     
     data = request.get_json()
     
-    # Validate required fields
     if not data.get('customer_name'):
         return jsonify({
             'exc': 'Mandatory field customer_name missing',
             'exc_type': 'ValidationError'
         }), 400
     
-    # Generate document name
-    doc_name = generate_doc_name('Customer')
+    db = get_db()
     
-    # Create customer document
-    customer = {
-        'name': doc_name,
-        'doctype': 'Customer',
-        'customer_name': data.get('customer_name'),
-        'customer_type': data.get('customer_type', 'Company'),
-        'customer_group': data.get('customer_group', 'All Customer Groups'),
-        'territory': data.get('territory', 'All Territories'),
-        'email_id': data.get('email_id'),
-        'mobile_no': data.get('mobile_no'),
-        'creation': datetime.now().isoformat(),
-        'modified': datetime.now().isoformat(),
-        'owner': 'Administrator',
-        'docstatus': 0  # 0 = Draft, 1 = Submitted, 2 = Cancelled
-    }
-    
-    # Store customer
-    documents['Customer'][doc_name] = customer
-    
-    return jsonify({
-        'data': customer
-    }), 201
+    try:
+        doc_name = generate_doc_name('Customer', db)
+        
+        customer = {
+            'name': doc_name,
+            'doctype': 'Customer',
+            'customer_name': data.get('customer_name'),
+            'customer_type': data.get('customer_type', 'Company'),
+            'customer_group': data.get('customer_group', 'All Customer Groups'),
+            'territory': data.get('territory', 'All Territories'),
+            'email_id': data.get('email_id'),
+            'mobile_no': data.get('mobile_no'),
+            'creation': datetime.now().isoformat(),
+            'modified': datetime.now().isoformat(),
+            'owner': 'Administrator',
+            'docstatus': 0
+        }
+        
+        save_document('Customer', doc_name, customer, db)
+        
+        return jsonify({
+            'data': customer
+        }), 201
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/Journal Entry', methods=['POST'])
@@ -191,7 +341,6 @@ def create_journal_entry():
     
     data = request.get_json()
     
-    # Validate required fields
     if not data.get('company'):
         return jsonify({
             'exc': 'Mandatory field company missing',
@@ -204,7 +353,6 @@ def create_journal_entry():
             'exc_type': 'ValidationError'
         }), 400
     
-    # Validate that debits = credits
     total_debit = sum(acc.get('debit_in_account_currency', 0) for acc in data['accounts'])
     total_credit = sum(acc.get('credit_in_account_currency', 0) for acc in data['accounts'])
     
@@ -214,34 +362,37 @@ def create_journal_entry():
             'exc_type': 'ValidationError'
         }), 400
     
-    # Generate document name
-    doc_name = generate_doc_name('Journal Entry')
+    db = get_db()
     
-    # Create journal entry document
-    journal_entry = {
-        'name': doc_name,
-        'doctype': 'Journal Entry',
-        'company': data.get('company'),
-        'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
-        'voucher_type': data.get('voucher_type', 'Journal Entry'),
-        'accounts': data.get('accounts'),
-        'user_remark': data.get('user_remark', ''),
-        'reference_number': data.get('reference_number', ''),
-        'total_debit': total_debit,
-        'total_credit': total_credit,
-        'difference': 0,
-        'creation': datetime.now().isoformat(),
-        'modified': datetime.now().isoformat(),
-        'owner': 'Administrator',
-        'docstatus': 0
-    }
-    
-    # Store journal entry
-    documents['Journal Entry'][doc_name] = journal_entry
-    
-    return jsonify({
-        'data': journal_entry
-    }), 201
+    try:
+        doc_name = generate_doc_name('Journal Entry', db)
+        
+        journal_entry = {
+            'name': doc_name,
+            'doctype': 'Journal Entry',
+            'company': data.get('company'),
+            'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
+            'voucher_type': data.get('voucher_type', 'Journal Entry'),
+            'accounts': data.get('accounts'),
+            'user_remark': data.get('user_remark', ''),
+            'reference_number': data.get('reference_number', ''),
+            'total_debit': total_debit,
+            'total_credit': total_credit,
+            'difference': 0,
+            'creation': datetime.now().isoformat(),
+            'modified': datetime.now().isoformat(),
+            'owner': 'Administrator',
+            'docstatus': 0
+        }
+        
+        save_document('Journal Entry', doc_name, journal_entry, db)
+        
+        return jsonify({
+            'data': journal_entry
+        }), 201
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/Purchase Invoice', methods=['POST'])
@@ -255,7 +406,6 @@ def create_purchase_invoice():
     
     data = request.get_json()
     
-    # Validate required fields
     if not data.get('supplier'):
         return jsonify({
             'exc': 'Mandatory field supplier missing',
@@ -268,36 +418,37 @@ def create_purchase_invoice():
             'exc_type': 'ValidationError'
         }), 400
     
-    # Generate document name
-    doc_name = generate_doc_name('Purchase Invoice')
+    db = get_db()
     
-    # Calculate totals
-    total = sum(item.get('amount', 0) for item in data['items'])
-    
-    # Create purchase invoice document
-    purchase_invoice = {
-        'name': doc_name,
-        'doctype': 'Purchase Invoice',
-        'supplier': data.get('supplier'),
-        'company': data.get('company'),
-        'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
-        'items': data.get('items'),
-        'total': total,
-        'grand_total': total,
-        'outstanding_amount': total,
-        'status': 'Draft',
-        'creation': datetime.now().isoformat(),
-        'modified': datetime.now().isoformat(),
-        'owner': 'Administrator',
-        'docstatus': 0
-    }
-    
-    # Store purchase invoice
-    documents['Purchase Invoice'][doc_name] = purchase_invoice
-    
-    return jsonify({
-        'data': purchase_invoice
-    }), 201
+    try:
+        doc_name = generate_doc_name('Purchase Invoice', db)
+        total = sum(item.get('amount', 0) for item in data['items'])
+        
+        purchase_invoice = {
+            'name': doc_name,
+            'doctype': 'Purchase Invoice',
+            'supplier': data.get('supplier'),
+            'company': data.get('company'),
+            'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
+            'items': data.get('items'),
+            'total': total,
+            'grand_total': total,
+            'outstanding_amount': total,
+            'status': 'Draft',
+            'creation': datetime.now().isoformat(),
+            'modified': datetime.now().isoformat(),
+            'owner': 'Administrator',
+            'docstatus': 0
+        }
+        
+        save_document('Purchase Invoice', doc_name, purchase_invoice, db)
+        
+        return jsonify({
+            'data': purchase_invoice
+        }), 201
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/Payment Entry', methods=['POST'])
@@ -311,7 +462,6 @@ def create_payment_entry():
     
     data = request.get_json()
     
-    # Validate required fields
     if not data.get('payment_type'):
         return jsonify({
             'exc': 'Mandatory field payment_type missing',
@@ -324,37 +474,40 @@ def create_payment_entry():
             'exc_type': 'ValidationError'
         }), 400
     
-    # Generate document name
-    doc_name = generate_doc_name('Payment Entry')
+    db = get_db()
     
-    # Create payment entry document
-    payment_entry = {
-        'name': doc_name,
-        'doctype': 'Payment Entry',
-        'payment_type': data.get('payment_type'),  # Receive, Pay
-        'party_type': data.get('party_type'),  # Customer, Supplier
-        'party': data.get('party'),
-        'company': data.get('company'),
-        'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
-        'paid_amount': data.get('paid_amount', 0),
-        'received_amount': data.get('received_amount', 0),
-        'paid_from': data.get('paid_from', ''),
-        'paid_to': data.get('paid_to', ''),
-        'reference_no': data.get('reference_no', ''),
-        'reference_date': data.get('reference_date', datetime.now().strftime('%Y-%m-%d')),
-        'status': 'Draft',
-        'creation': datetime.now().isoformat(),
-        'modified': datetime.now().isoformat(),
-        'owner': 'Administrator',
-        'docstatus': 0
-    }
-    
-    # Store payment entry
-    documents['Payment Entry'][doc_name] = payment_entry
-    
-    return jsonify({
-        'data': payment_entry
-    }), 201
+    try:
+        doc_name = generate_doc_name('Payment Entry', db)
+        
+        payment_entry = {
+            'name': doc_name,
+            'doctype': 'Payment Entry',
+            'payment_type': data.get('payment_type'),
+            'party_type': data.get('party_type'),
+            'party': data.get('party'),
+            'company': data.get('company'),
+            'posting_date': data.get('posting_date', datetime.now().strftime('%Y-%m-%d')),
+            'paid_amount': data.get('paid_amount', 0),
+            'received_amount': data.get('received_amount', 0),
+            'paid_from': data.get('paid_from', ''),
+            'paid_to': data.get('paid_to', ''),
+            'reference_no': data.get('reference_no', ''),
+            'reference_date': data.get('reference_date', datetime.now().strftime('%Y-%m-%d')),
+            'status': 'Draft',
+            'creation': datetime.now().isoformat(),
+            'modified': datetime.now().isoformat(),
+            'owner': 'Administrator',
+            'docstatus': 0
+        }
+        
+        save_document('Payment Entry', doc_name, payment_entry, db)
+        
+        return jsonify({
+            'data': payment_entry
+        }), 201
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/<doctype>/<name>', methods=['PUT'])
@@ -366,27 +519,29 @@ def update_resource(doctype, name):
             'exc_type': 'AuthenticationError'
         }), 401
     
-    if doctype not in documents:
+    db = get_db()
+    
+    try:
+        doc = get_document(doctype, name, db)
+        
+        if not doc:
+            return jsonify({
+                'exc': f'{doctype} {name} not found',
+                'exc_type': 'DoesNotExistError'
+            }), 404
+        
+        update_data = request.get_json()
+        doc.update(update_data)
+        doc['modified'] = datetime.now().isoformat()
+        
+        save_document(doctype, name, doc, db)
+        
         return jsonify({
-            'exc': f'DocType {doctype} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    if name not in documents[doctype]:
-        return jsonify({
-            'exc': f'{doctype} {name} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    data = request.get_json()
-    
-    # Update document
-    documents[doctype][name].update(data)
-    documents[doctype][name]['modified'] = datetime.now().isoformat()
-    
-    return jsonify({
-        'data': documents[doctype][name]
-    })
+            'data': doc
+        })
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/api/resource/<doctype>/<name>', methods=['DELETE'])
@@ -398,48 +553,46 @@ def delete_resource(doctype, name):
             'exc_type': 'AuthenticationError'
         }), 401
     
-    if doctype not in documents:
+    db = get_db()
+    
+    try:
+        success = delete_document(doctype, name, db)
+        
+        if not success:
+            return jsonify({
+                'exc': f'{doctype} {name} not found',
+                'exc_type': 'DoesNotExistError'
+            }), 404
+        
         return jsonify({
-            'exc': f'DocType {doctype} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    if name not in documents[doctype]:
-        return jsonify({
-            'exc': f'{doctype} {name} not found',
-            'exc_type': 'DoesNotExistError'
-        }), 404
-    
-    # Delete document
-    del documents[doctype][name]
-    
-    return jsonify({
-        'message': 'ok'
-    })
+            'message': 'ok'
+        })
+    finally:
+        if db:
+            db.close()
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    db = get_db()
+    db_status = "connected" if db else "in-memory fallback"
+    
+    if db:
+        try:
+            count = db.query(Document).count()
+            db.close()
+            doc_count = count
+        except:
+            doc_count = 0
+    else:
+        doc_count = sum(len(docs) for docs in documents_memory.values())
+    
     return jsonify({
         'status': 'ok',
         'message': 'ERPNext Mock API is running',
-        'documents_count': {
-            doctype: len(docs) for doctype, docs in documents.items()
-        }
-    })
-
-
-@app.route('/api/resource', methods=['GET'])
-def list_doctypes():
-    """List available doctypes"""
-    return jsonify({
-        'data': [
-            {'name': 'Customer'},
-            {'name': 'Journal Entry'},
-            {'name': 'Purchase Invoice'},
-            {'name': 'Payment Entry'}
-        ]
+        'database': db_status,
+        'total_documents': doc_count
     })
 
 
@@ -454,30 +607,23 @@ def not_found(e):
 @app.errorhandler(500)
 def internal_error(e):
     return jsonify({
-        'exc': 'Internal Server Error',
+        'exc': str(e),
         'exc_type': 'InternalError'
     }), 500
 
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("ERPNext Mock API Server")
+    print("ERPNext Mock API Server with SQL Database")
     print("=" * 60)
+    print("\nDatabase:")
+    print(f"  Status: {'✅ Connected' if engine else '❌ Using in-memory fallback'}")
+    if engine:
+        print(f"  URL: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else 'configured'}")
     print("\nAuthentication:")
     print("  API Key: test_api_key")
     print("  API Secret: test_api_secret")
     print("  Header: Authorization: token test_api_key:test_api_secret")
-    print("\nAvailable Endpoints:")
-    print("  GET  /api/method/frappe.auth.get_logged_user")
-    print("  GET  /api/resource/Customer")
-    print("  POST /api/resource/Customer")
-    print("  GET  /api/resource/Journal Entry")
-    print("  POST /api/resource/Journal Entry")
-    print("  GET  /api/resource/Purchase Invoice")
-    print("  POST /api/resource/Purchase Invoice")
-    print("  GET  /api/resource/Payment Entry")
-    print("  POST /api/resource/Payment Entry")
-    print("  GET  /health")
     print("\nStarting server on http://localhost:8000")
     print("=" * 60)
     
