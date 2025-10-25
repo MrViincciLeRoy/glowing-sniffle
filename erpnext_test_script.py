@@ -8,7 +8,7 @@ import json
 from datetime import datetime
 
 # Configuration
-BASE_URL = "http://localhost:8000"
+BASE_URL = "https://glowing-sniffle-ocpc.onrender.com"
 API_KEY = "test_api_key"
 API_SECRET = "test_api_secret"
 
